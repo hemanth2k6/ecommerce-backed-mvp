@@ -86,7 +86,7 @@ FOR EACH ROW EXECUTE FUNCTION trigger_set_timestamp();
 INSERT INTO users (email, password_hash, first_name, last_name, address)
 VALUES (
     'demo@example.com',
-    '$2b$12$placeholderplaceholders0000000000000000000000000000',
+    '$2b$10$Q/t.IN4h/UyHQTba.6DAe.hAJoP3Rs8qx5vegAGhl2h6Xc0xIHkFy',
     'Demo',
     'User',
     '1 Demo St, Testville, TS 00000'

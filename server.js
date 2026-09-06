@@ -1,5 +1,8 @@
 require('dotenv').config();
 const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const db = require('./db');
 const cache = require('./redis');
 
@@ -8,6 +11,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 const PRODUCTS_CACHE_TTL = parseInt(process.env.PRODUCTS_CACHE_TTL_SEC || 30, 10);
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key-change-me-in-production';
 
 const PRODUCTS_CACHE_KEY_PREFIX = 'products:list:';
 
@@ -33,6 +37,21 @@ async function invalidateProductsCache() {
   }
 }
 
+function authenticateUser(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid token' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired token' });
+  }
+}
+
 app.get('/api/v1/health', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT NOW() AS now');
@@ -43,6 +62,50 @@ app.get('/api/v1/health', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message, cache_ready: cache.isReady() });
+  }
+});
+
+app.post('/api/v1/users/register', async (req, res) => {
+  const { email, password, first_name, last_name, address } = req.body;
+  if (!email || !password || !first_name || !last_name) {
+    return res.status(400).json({ error: 'missing_fields', message: 'email, password, first_name, and last_name are required' });
+  }
+  try {
+    const password_hash = await bcrypt.hash(password, 10);
+    const { rows } = await db.query(
+      `INSERT INTO users (email, password_hash, first_name, last_name, address)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, email, first_name, last_name, role, created_at`,
+      [email, password_hash, first_name, last_name, address || null]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'conflict', message: 'Email already exists' });
+    }
+    res.status(500).json({ error: 'server_error', message: err.message });
+  }
+});
+
+app.post('/api/v1/users/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'missing_fields', message: 'email and password are required' });
+  }
+  try {
+    const { rows } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (rows.length === 0) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Invalid credentials' });
+    }
+    const user = rows[0];
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
+    res.json({ token, user: { id: user.id, email: user.email, first_name: user.first_name, last_name: user.last_name, role: user.role } });
+  } catch (err) {
+    res.status(500).json({ error: 'server_error', message: err.message });
   }
 });
 
@@ -177,6 +240,27 @@ app.get('/api/v1/products', async (req, res) => {
   }
 });
 
+app.get('/api/v1/products/:id', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM products WHERE id = $1 AND is_active = TRUE', [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'not_found', message: 'Product not found' });
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'server_error', message: err.message });
+  }
+});
+
+app.get('/api/v1/orders', authenticateUser, async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: 'server_error', message: err.message });
+  }
+});
+
 function stockErrorBody(product_id, requested, available) {
   const isOutOfStock = available === 0;
   return {
@@ -188,12 +272,10 @@ function stockErrorBody(product_id, requested, available) {
   };
 }
 
-app.post('/api/v1/orders', async (req, res) => {
-  const { user_id, items, shipping_address, billing_address } = req.body;
+app.post('/api/v1/orders', authenticateUser, async (req, res) => {
+  const { items, shipping_address, billing_address } = req.body;
+  const user_id = req.user.id;
 
-  if (!user_id) {
-    return res.status(400).json({ error: 'missing_fields', message: 'user_id is required' });
-  }
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'missing_fields', message: 'items array is required and must not be empty' });
   }
@@ -232,7 +314,20 @@ app.post('/api/v1/orders', async (req, res) => {
         return res.status(400).json({ error: 'invalid_user', message: `user_id ${user_id} does not exist` });
       }
 
-      const sortedItems = [...items].sort((a, b) => Number(a.product_id) - Number(b.product_id));
+      // Aggregate quantities for duplicate product_ids to prevent multiple locks/deductions on the same row
+      const aggregatedItemsMap = new Map();
+      for (const it of items) {
+        const pid = String(it.product_id);
+        const qty = Number(it.quantity);
+        if (aggregatedItemsMap.has(pid)) {
+          aggregatedItemsMap.get(pid).quantity += qty;
+        } else {
+          aggregatedItemsMap.set(pid, { product_id: pid, quantity: qty });
+        }
+      }
+      
+      const aggregatedItems = Array.from(aggregatedItemsMap.values());
+      const sortedItems = aggregatedItems.sort((a, b) => Number(a.product_id) - Number(b.product_id));
 
       const lineItems = [];
       let totalAmount = 0;
@@ -299,9 +394,8 @@ app.post('/api/v1/orders', async (req, res) => {
         });
       }
 
-      const date = new Date();
-      const yyyymmdd = date.toISOString().slice(0, 10).replace(/-/g, '');
-      const orderNumber = `ORD-${yyyymmdd}-${String(Date.now()).slice(-6)}`;
+      // Generate a UUID to prevent race conditions on unique index
+      const orderNumber = `ORD-${crypto.randomUUID()}`;
 
       const orderResult = await client.query(
         `INSERT INTO orders
