@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/ecommerce_mvp
+      - REDIS_URL=redis://cache:6379
+      - PRODUCTS_CACHE_TTL_SEC=30
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=ecommerce_mvp
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce_mvp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
