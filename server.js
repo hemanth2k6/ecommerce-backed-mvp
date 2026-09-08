@@ -61,7 +61,12 @@ app.get('/api/v1/health', async (req, res) => {
       cache_ready: cache.isReady(),
     });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message, cache_ready: cache.isReady() });
+    res.status(500).json({ 
+      status: 'error', 
+      message: err.message || String(err), 
+      stack: err.stack,
+      cache_ready: cache.isReady() 
+    });
   }
 });
 
